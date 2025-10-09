@@ -153,8 +153,16 @@ struct Element<'a> {
 }
 
 impl<'a> Element<'a> {
-    fn new(class: Option<Class>, text: Cow<'a, str>, needs_escape: bool) -> Self {
-        Self { class, content: vec![Content { text, class, needs_escape }] }
+    fn new(
+        class: Option<Class>,
+        text: Cow<'a, str>,
+        needs_escape: bool,
+        reusable_vec: &mut Option<ClearedVec<Content<'a>>>,
+    ) -> Self {
+        let mut content =
+            reusable_vec.take().map(|rv| rv.get()).unwrap_or_else(|| Vec::with_capacity(1));
+        content.push(Content { text, class, needs_escape });
+        Self { class, content }
     }
 
     fn can_merge(&self, other: &Self) -> bool {
@@ -232,7 +240,8 @@ impl<'a> ElementStack<'a> {
         Self { elements: Vec::new(), parent: None, class, pending_exit: false }
     }
 
-    fn push_element(&mut self, mut elem: Element<'a>) {
+    #[must_use]
+    fn push_element(&mut self, mut elem: Element<'a>) -> Option<ClearedVec<Content<'a>>> {
         if self.pending_exit
             && !can_merge(self.class, elem.class, elem.content.first().map_or("", |c| &c.text))
         {
@@ -242,8 +251,10 @@ impl<'a> ElementStack<'a> {
             && last.can_merge(&elem)
         {
             last.content.append(&mut elem.content);
+            Some(ClearedVec::new(elem.content))
         } else {
             self.elements.push(ElementOrStack::Element(elem));
+            None
         }
     }
 
@@ -379,6 +390,19 @@ impl<'a> ElementStack<'a> {
     }
 }
 
+struct ClearedVec<T>(Vec<T>);
+
+impl<T> ClearedVec<T> {
+    fn new(mut v: Vec<T>) -> Self {
+        v.clear();
+        Self(v)
+    }
+
+    fn get(self) -> Vec<T> {
+        self.0
+    }
+}
+
 /// This type is used as a conveniency to prevent having to pass all its fields as arguments into
 /// the various functions (which became its methods).
 struct TokenHandler<'a, 'tcx, F: Write> {
@@ -390,6 +414,7 @@ struct TokenHandler<'a, 'tcx, F: Write> {
     write_line_number: fn(u32) -> String,
     line: u32,
     max_lines: u32,
+    reusable_vec: Option<ClearedVec<Content<'a>>>,
 }
 
 impl<F: Write> std::fmt::Debug for TokenHandler<'_, '_, F> {
@@ -425,7 +450,15 @@ impl<'a, F: Write> TokenHandler<'a, '_, F> {
         text: Cow<'a, str>,
         needs_escape: bool,
     ) {
-        self.element_stack.push_element(Element::new(class, text, needs_escape));
+        let new_reusable = self.element_stack.push_element(Element::new(
+            class,
+            text,
+            needs_escape,
+            &mut self.reusable_vec,
+        ));
+        if let Some(v) = new_reusable {
+            self.reusable_vec = Some(v);
+        }
         self.maybe_write_content();
     }
 
@@ -469,11 +502,15 @@ impl<'a, F: Write> TokenHandler<'a, '_, F> {
     }
 
     fn add_expanded_code(&mut self, expanded_code: &ExpandedCode) {
-        self.element_stack.push_element(Element::new(
+        let new_reusable = self.element_stack.push_element(Element::new(
             None,
             Cow::Owned(format!("<span class=expanded>{}</span>", expanded_code.code)),
             false,
+            &mut self.reusable_vec,
         ));
+        if let Some(v) = new_reusable {
+            self.reusable_vec = Some(v);
+        }
         self.element_stack.enter_stack(ElementStack::new_with_class(Some(Class::Original)));
     }
 
@@ -619,6 +656,7 @@ pub(super) fn write_code(
         line: 0,
         max_lines: u32::MAX,
         element_stack: ElementStack::new(),
+        reusable_vec: None,
     };
 
     if let Some(line_info) = line_info {
